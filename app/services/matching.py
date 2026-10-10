@@ -1,3 +1,4 @@
+
 from app.schemas.room import DecisionType
 
 
@@ -18,13 +19,7 @@ class MatchingService:
         self.match_repository = match_repository
         self.session_repository = session_repository
 
-    def submit_decision(
-        self,
-        code,
-        round_number,
-        user_id,
-        decision,
-    ):
+    def submit_decision(self, code, round_number, user_id, decision):
         room = self.room_repository.get_room(code)
 
         if not room:
@@ -67,28 +62,26 @@ class MatchingService:
 
     def evaluate_round(self, code, round_number):
         members = self.member_repository.get_members(code)
-
         decisions = self.decision_repository.get_decisions(
             code,
             round_number,
         )
 
-        # Wait until every current member has decided.
+        # Do not advance until every current member has decided.
         if not members.issubset(decisions.keys()):
             return {
                 "status": "waiting",
-                "round_number": round_number,
+                "round_number": int(round_number),
             }
 
         like_count = sum(
             decision == DecisionType.LIKE.value
             for decision in decisions.values()
         )
-
         matched = like_count >= 2
 
-        # Preserve basic decision evaluation when lifecycle
-        # repositories have not been provided.
+        # Keep compatibility with tests that use only the basic
+        # decision-evaluation dependencies.
         if not all((
             self.movie_repository,
             self.match_repository,
@@ -96,7 +89,7 @@ class MatchingService:
         )):
             return {
                 "status": "completed",
-                "round_number": round_number,
+                "round_number": int(round_number),
                 "matched": matched,
                 "like_count": like_count,
             }
@@ -116,34 +109,39 @@ class MatchingService:
 
             return {
                 "status": "ended",
-                "round_number": round_number,
+                "round_number": int(round_number),
                 "matched": matched,
                 "like_count": like_count,
+                "matched_movie": None,
+                "next_movie": None,
+                "next_round": None,
             }
 
-        # The first movie in the Redis list is the current movie.
-        current_movie = movies[0]
+        # Save the completed movie before removing it from the pool.
+        completed_movie = movies[0]
 
-        # Save the movie if at least two members liked it.
         if matched:
-            self.match_repository.add_match(code, current_movie)
+            self.match_repository.add_match(code, completed_movie)
 
-        # Remove the completed movie from the pool.
+        # Remove the movie that every member just decided on.
         self.movie_repository.get_next_movie(code)
 
-        remaining_movies = self.movie_repository.movie_count(code)
+        remaining_movies = self.movie_repository.get_movies(code)
 
-        if remaining_movies == 0:
+        # There is no next round when the pool is exhausted.
+        if not remaining_movies:
             self._end_session(code)
 
             return {
                 "status": "ended",
-                "round_number": round_number,
+                "round_number": int(round_number),
                 "matched": matched,
                 "like_count": like_count,
+                "matched_movie": completed_movie if matched else None,
+                "next_movie": None,
+                "next_round": None,
             }
 
-        # Prepare the next round.
         next_round = int(round_number) + 1
 
         self.session_repository.update_session(
@@ -156,7 +154,8 @@ class MatchingService:
             "round_number": int(round_number),
             "matched": matched,
             "like_count": like_count,
-            "current_movie": current_movie,
+            "matched_movie": completed_movie if matched else None,
+            "next_movie": remaining_movies[0],
             "next_round": next_round,
         }
 
@@ -165,5 +164,4 @@ class MatchingService:
             code,
             status="ended",
         )
-
         self.room_repository.update_status(code, "ended")

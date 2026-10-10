@@ -18,7 +18,7 @@ router = APIRouter(
 
 
 def serialize_data(value):
-    """Convert Pydantic models into JSON-serializable data."""
+    """Convert Pydantic models to JSON-compatible data."""
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
 
@@ -28,12 +28,8 @@ def serialize_data(value):
     return value
 
 
-async def broadcast_event(
-    room_code: str,
-    event: str,
-    data: dict,
-):
-    """Broadcast a consistently structured event."""
+async def broadcast_event(room_code: str, event: str, data):
+    """Send a consistently structured event to room members."""
     message = json.dumps({
         "event": event,
         "data": serialize_data(data),
@@ -42,7 +38,7 @@ async def broadcast_event(
     await manager.broadcast(room_code, message)
 
 
-def publish_event(room_code: str, event: str, data: dict):
+def publish_event(room_code: str, event: str, data):
     """Publish an event from a synchronous route."""
     anyio.from_thread.run(
         broadcast_event,
@@ -53,7 +49,7 @@ def publish_event(room_code: str, event: str, data: dict):
 
 
 def raise_room_error(error: ValueError):
-    """Translate service errors into HTTP errors."""
+    """Convert service errors to HTTP errors."""
     message = str(error)
 
     if message == "Room not found":
@@ -210,7 +206,6 @@ def submit_decision(
 
         result = serialize_data(result)
         result_status = result.get("status")
-        matched = result.get("matched", False)
 
         if result_status == "waiting":
             publish_event(
@@ -220,7 +215,7 @@ def submit_decision(
             )
 
         elif result_status == "completed":
-            if matched:
+            if result.get("matched"):
                 publish_event(
                     code,
                     "match_found",
@@ -234,7 +229,7 @@ def submit_decision(
             )
 
         elif result_status == "ended":
-            if matched:
+            if result.get("matched"):
                 publish_event(
                     code,
                     "match_found",
