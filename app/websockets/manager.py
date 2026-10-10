@@ -1,4 +1,5 @@
-from fastapi import WebSocket
+
+from fastapi import WebSocket, WebSocketDisconnect
 
 
 class ConnectionManager:
@@ -12,7 +13,7 @@ class ConnectionManager:
             self.active_connections[room_code] = set()
 
         self.active_connections[room_code].add(websocket)
-    
+
     def disconnect(self, room_code: str, websocket: WebSocket):
         connections = self.active_connections.get(room_code)
 
@@ -21,7 +22,9 @@ class ConnectionManager:
 
         connections.discard(websocket)
 
-    
+        if not connections:
+            self.active_connections.pop(room_code, None)
+
     async def broadcast(self, room_code: str, message: str):
         connections = self.active_connections.get(room_code)
 
@@ -29,5 +32,7 @@ class ConnectionManager:
             return
 
         for websocket in connections.copy():
-            await websocket.send_text(message)
-
+            try:
+                await websocket.send_text(message)
+            except (WebSocketDisconnect, RuntimeError, OSError):
+                self.disconnect(room_code, websocket)

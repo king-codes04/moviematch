@@ -26,6 +26,7 @@ async def test_connect_registers_websocket_in_room():
     websocket.accept.assert_awaited_once()
 
 
+
 @pytest.mark.anyio
 async def test_disconnect_removes_websocket_from_room():
     # Arrange
@@ -39,7 +40,7 @@ async def test_disconnect_removes_websocket_from_room():
     manager.disconnect(room_code, websocket)
 
     # Assert
-    assert websocket not in manager.active_connections[room_code]
+    assert room_code not in manager.active_connections
 
 
 @pytest.mark.anyio
@@ -78,3 +79,29 @@ async def test_broadcast_to_empty_room_does_not_raise_error():
     # Assert
     assert room_code not in manager.active_connections
 
+
+
+@pytest.mark.anyio
+async def test_broadcast_continues_when_one_websocket_fails():
+    # Arrange
+    manager = ConnectionManager()
+    broken_socket = FakeWebSocket()
+    healthy_socket = FakeWebSocket()
+    room_code = "ABC123"
+    message = '{"event": "room_started"}'
+
+    await manager.connect(room_code, broken_socket)
+    await manager.connect(room_code, healthy_socket)
+
+    broken_socket.send_text.side_effect = RuntimeError(
+        "Connection is closed"
+    )
+
+    # Act
+    await manager.broadcast(room_code, message)
+
+    # Assert
+    broken_socket.send_text.assert_awaited_once_with(message)
+    healthy_socket.send_text.assert_awaited_once_with(message)
+    assert broken_socket not in manager.active_connections[room_code]
+    assert healthy_socket in manager.active_connections[room_code]
