@@ -1,7 +1,13 @@
 from fastapi import FastAPI
 from app.core.redis import redis_client
+from app.routes.room import router
+from app.websockets.routes import router as websocket_router
 
 app = FastAPI()
+
+app.include_router(router)
+
+app.include_router(websocket_router)
 
 @app.get("/")
 def welcome():

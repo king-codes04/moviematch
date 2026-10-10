@@ -1,9 +1,10 @@
+
 class DecisionRepository:
     def __init__(self, client):
         self.client = client
 
     def submit_decision(self, code, round_number, user_id, decision):
-        return self.client.hset(
+        return self.client.hsetnx(
             f"DECISIONS:{code}:ROUND:{round_number}",
             user_id,
             decision

@@ -33,3 +33,19 @@ class MovieRepository:
 
     def delete_movies(self, code):
         return self.client.delete(f"MOVIES:{code}")
+
+    
+    def add_movies(self, code, movies):
+      if not movies:
+        raise ValueError("Movie pool cannot be empty")
+
+      serialized_movies = [
+        json.dumps(movie) for movie in movies
+    ]
+
+      self.client.delete(f"MOVIES:{code}")
+
+      return self.client.rpush(
+        f"MOVIES:{code}",
+        *serialized_movies
+    )

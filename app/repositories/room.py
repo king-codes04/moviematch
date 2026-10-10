@@ -23,5 +23,8 @@ class RoomRepository:
             mapping={"status": status}
         )
 
+    def update_status(self, code, status):
+        return self.update_room(code, status)
+
     def delete_room(self, code):
         return self.client.delete(f"ROOM:{code}")

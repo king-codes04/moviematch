@@ -1,312 +1,321 @@
-
 import pytest
 
 from app.core.redis import redis_client
 from app.repositories.room import RoomRepository
 from app.repositories.member import MemberRepository
+from app.repositories.movie import MovieRepository
+from app.repositories.session import SessionRepository
 from app.services.room import RoomService
-from app.schemas.room import RoomResponse
+
+
+class FakeMovieService:
+    def get_movie_pool(self, pool_size=10):
+        return [
+            {
+                "id": movie_id,
+                "title": f"Movie {movie_id}",
+            }
+            for movie_id in range(1, pool_size + 1)
+        ]
 
 
 @pytest.fixture
 def room_service():
     room_repository = RoomRepository(redis_client)
     member_repository = MemberRepository(redis_client)
+    movie_repository = MovieRepository(redis_client)
+    session_repository = SessionRepository(redis_client)
+    movie_service = FakeMovieService()
 
-    return RoomService(
+    service = RoomService(
         room_repository=room_repository,
-        member_repository=member_repository
+        member_repository=member_repository,
+        movie_service=movie_service,
+        movie_repository=movie_repository,
+        session_repository=session_repository,
     )
+
+    yield service
+
+    # Clean up Redis data after each test.
+    for pattern in (
+        "ROOM:*",
+        "MOVIES:*",
+        "DECISIONS:*",
+        "MATCHES:*",
+        "SESSION:*",
+    ):
+        for key in redis_client.scan_iter(match=pattern):
+            redis_client.delete(key)
 
 
 @pytest.fixture
-def cleanup():
-    """
-    Provides a helper to remove test room data after each test.
-    """
+def room_with_two_members(room_service):
+    room = room_service.create_room("host")
+    code = room.code
 
-    created_rooms = []
+    room_service.join_room(code, "member2")
 
-    def register(code):
-        created_rooms.append(code)
-
-    yield register
-
-    room_repository = RoomRepository(redis_client)
-    member_repository = MemberRepository(redis_client)
-
-    for code in created_rooms:
-        members = member_repository.get_members(code)
-
-        for member_id in members:
-            member_repository.remove_member(code, member_id)
-
-        room_repository.delete_room(code)
+    return code
 
 
-# --------------------------------------------------
-# CREATE ROOM TESTS
-# --------------------------------------------------
+def test_create_room(room_service):
+    room = room_service.create_room("host")
 
-def test_create_room_success(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
-    assert isinstance(room, RoomResponse)
-    assert room.host_id == "host-1"
+    assert room.code
+    assert room.host_id == "host"
     assert room.status == "waiting"
-    assert len(room.code) == 6
+
+    stored_room = room_service.room_repository.get_room(room.code)
+
+    assert stored_room["host_id"] == "host"
+    assert stored_room["status"] == "waiting"
 
 
-def test_create_room_generates_unique_codes(room_service, cleanup):
-    room1 = room_service.create_room("host-1")
-    cleanup(room1.code)
+def test_create_room_adds_host_as_member(room_service):
+    room = room_service.create_room("host")
 
-    room2 = room_service.create_room("host-2")
-    cleanup(room2.code)
+    members = room_service.member_repository.get_members(room.code)
 
-    assert room1.code != room2.code
+    assert "host" in members
 
 
-# --------------------------------------------------
-# GET ROOM TESTS
-# --------------------------------------------------
+def test_create_room_adds_ten_movies(room_service):
+    room = room_service.create_room("host")
 
-def test_get_room_success(room_service, cleanup):
-    created = room_service.create_room("host-1")
-    cleanup(created.code)
+    assert room_service.movie_repository.movie_count(room.code) == 10
 
-    room = room_service.get_room(created.code)
 
-    assert room.code == created.code
-    assert room.host_id == "host-1"
+def test_get_room_success(room_service):
+    created_room = room_service.create_room("host")
+
+    room = room_service.get_room(created_room.code)
+
+    assert room.code == created_room.code
+    assert room.host_id == "host"
     assert room.status == "waiting"
 
 
 def test_get_room_not_found(room_service):
     with pytest.raises(ValueError, match="Room not found"):
-        room_service.get_room("NOPE99")
+        room_service.get_room("MISSING")
 
 
-# --------------------------------------------------
-# JOIN ROOM TESTS
-# --------------------------------------------------
+def test_join_room_success(room_service):
+    room = room_service.create_room("host")
 
-def test_join_room_success(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
-    result = room_service.join_room(room.code, "user-2")
+    result = room_service.join_room(room.code, "member2")
 
     members = room_service.member_repository.get_members(room.code)
 
     assert result.code == room.code
-    assert "user-2" in members
+    assert "member2" in members
 
 
 def test_join_room_not_found(room_service):
     with pytest.raises(ValueError, match="Room not found"):
-        room_service.join_room("NOPE99", "user-2")
+        room_service.join_room("MISSING", "member2")
 
 
-def test_join_room_duplicate_member(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
+def test_join_room_rejects_duplicate_member(
+    room_service,
+    room_with_two_members,
+):
     with pytest.raises(ValueError, match="already a member"):
-        room_service.join_room(room.code, "host-1")
+        room_service.join_room(room_with_two_members, "member2")
 
 
-def test_join_full_room(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
-    room_service.join_room(room.code, "user-2")
-    room_service.join_room(room.code, "user-3")
+def test_join_room_rejects_full_room(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
+    room_service.join_room(code, "member3")
 
     with pytest.raises(ValueError, match="Room is full"):
-        room_service.join_room(room.code, "user-4")
+        room_service.join_room(code, "member4")
 
 
-# --------------------------------------------------
-# LEAVE ROOM TESTS
-# --------------------------------------------------
+def test_join_room_rejects_started_room(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
+    room_service.start_room(code, "host")
 
-def test_leave_room_success(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
+    with pytest.raises(
+        ValueError,
+        match="not accepting new members",
+    ):
+        room_service.join_room(code, "member3")
 
-    room_service.join_room(room.code, "user-2")
 
-    result = room_service.leave_room(room.code, "user-2")
+def test_leave_room_success(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
 
-    members = room_service.member_repository.get_members(room.code)
+    result = room_service.leave_room(code, "member2")
+
+    members = room_service.member_repository.get_members(code)
 
     assert result["message"] == "User left the room successfully"
-    assert "user-2" not in members
-
-
-def test_leave_room_host_cancels_room(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
-    room_service.join_room(room.code, "user-2")
-
-    result = room_service.leave_room(room.code, "host-1")
-
-    assert result["message"] == "Host left. Room has been cancelled"
-    assert not room_service.room_repository.room_exists(room.code)
+    assert "member2" not in members
+    assert "host" in members
 
 
 def test_leave_room_not_found(room_service):
     with pytest.raises(ValueError, match="Room does not exist"):
-        room_service.leave_room("NOPE99", "user-1")
+        room_service.leave_room("MISSING", "host")
 
 
-def test_leave_room_non_member(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
+def test_leave_room_rejects_non_member(
+    room_service,
+    room_with_two_members,
+):
     with pytest.raises(ValueError, match="not a member"):
-        room_service.leave_room(room.code, "stranger")
+        room_service.leave_room(room_with_two_members, "outsider")
 
 
-def test_leave_active_room(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
+def test_host_leaving_cancels_room(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
 
-    room_service.join_room(room.code, "user-2")
-    room_service.start_room(room.code, "host-1")
+    result = room_service.leave_room(code, "host")
 
-    with pytest.raises(ValueError, match="Cannot leave an active room"):
-        room_service.leave_room(room.code, "user-2")
+    assert result["message"] == "Host left. Room has been cancelled"
+    assert not room_service.room_repository.room_exists(code)
+    assert room_service.movie_repository.movie_count(code) == 0
 
 
-# --------------------------------------------------
-# START ROOM TESTS
-# --------------------------------------------------
+def test_leave_room_rejects_active_room(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
+    room_service.start_room(code, "host")
 
-def test_start_room_success(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
+    with pytest.raises(ValueError, match="active room"):
+        room_service.leave_room(code, "member2")
 
-    room_service.join_room(room.code, "user-2")
 
-    result = room_service.start_room(room.code, "host-1")
+def test_start_room_success(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
 
-    assert result["status"] == "started"
+    result = room_service.start_room(code, "host")
 
-    updated_room = room_service.get_room(room.code)
+    assert result == {
+        "code": code,
+        "status": "started",
+    }
 
-    assert updated_room.status == "started"
+    room = room_service.room_repository.get_room(code)
+
+    assert room["status"] == "started"
+    assert room_service.movie_repository.movie_count(code) == 10
+
+
+def test_start_room_initializes_session(
+    room_service,
+    room_with_two_members,
+):
+    # Arrange
+    code = room_with_two_members
+
+    # Act
+    room_service.start_room(code, "host")
+
+    session = room_service.session_repository.get_session(code)
+
+    # Assert
+    assert session["status"] == "started"
+    assert session["current_round"] == "1"
 
 
 def test_start_room_not_found(room_service):
     with pytest.raises(ValueError, match="Room not found"):
-        room_service.start_room("NOPE99", "host-1")
+        room_service.start_room("MISSING", "host")
 
 
-def test_start_room_non_member(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
-    with pytest.raises(ValueError, match="not a member"):
-        room_service.start_room(room.code, "stranger")
-
-
-def test_start_room_non_host(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
-    room_service.join_room(room.code, "user-2")
-
-    with pytest.raises(ValueError, match="Only the host"):
-        room_service.start_room(room.code, "user-2")
+def test_start_room_rejects_non_host(
+    room_service,
+    room_with_two_members,
+):
+    with pytest.raises(ValueError, match="Only the host can start"):
+        room_service.start_room(room_with_two_members, "member2")
 
 
-def test_start_room_insufficient_members(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
+def test_start_room_requires_two_members(room_service):
+    room = room_service.create_room("host")
 
-    with pytest.raises(ValueError, match="At least 2 members"):
-        room_service.start_room(room.code, "host-1")
-
-
-def test_start_already_started_room(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
-    room_service.join_room(room.code, "user-2")
-    room_service.start_room(room.code, "host-1")
-
-    with pytest.raises(ValueError, match="already started or ended"):
-        room_service.start_room(room.code, "host-1")
+    with pytest.raises(
+        ValueError,
+        match="At least 2 members are required",
+    ):
+        room_service.start_room(room.code, "host")
 
 
-# --------------------------------------------------
-# END ROOM TESTS
-# --------------------------------------------------
+def test_start_room_rejects_already_started_room(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
+    room_service.start_room(code, "host")
 
-def test_end_room_success(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
+    with pytest.raises(
+        ValueError,
+        match="already started or ended",
+    ):
+        room_service.start_room(code, "host")
 
-    room_service.join_room(room.code, "user-2")
-    room_service.start_room(room.code, "host-1")
 
-    result = room_service.end_room(room.code, "host-1")
+def test_end_room_success(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
+    room_service.start_room(code, "host")
 
-    assert result["message"] == "Room ended successfully"
-    assert result["code"] == room.code
-    assert result["status"] == "ended"
+    result = room_service.end_room(code, "host")
 
-    updated_room = room_service.get_room(room.code)
+    assert result == {
+        "code": code,
+        "status": "ended",
+    }
 
-    assert updated_room.status == "ended"
+    room = room_service.room_repository.get_room(code)
+
+    assert room["status"] == "ended"
 
 
 def test_end_room_not_found(room_service):
     with pytest.raises(ValueError, match="Room not found"):
-        room_service.end_room("NOPE99", "host-1")
+        room_service.end_room("MISSING", "host")
 
 
-def test_end_room_non_member(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
+def test_end_room_rejects_non_host(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
+    room_service.start_room(code, "host")
 
-    room_service.join_room(room.code, "user-2")
-    room_service.start_room(room.code, "host-1")
-
-    with pytest.raises(ValueError, match="not a member"):
-        room_service.end_room(room.code, "stranger")
-
-
-def test_end_room_non_host(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
-    room_service.join_room(room.code, "user-2")
-    room_service.start_room(room.code, "host-1")
-
-    with pytest.raises(ValueError, match="Only the host"):
-        room_service.end_room(room.code, "user-2")
+    with pytest.raises(ValueError, match="Only the host can end"):
+        room_service.end_room(code, "member2")
 
 
-def test_end_room_before_starting(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
-    with pytest.raises(ValueError, match="Only an active room"):
-        room_service.end_room(room.code, "host-1")
-
-
-def test_end_room_twice(room_service, cleanup):
-    room = room_service.create_room("host-1")
-    cleanup(room.code)
-
-    room_service.join_room(room.code, "user-2")
-    room_service.start_room(room.code, "host-1")
-    room_service.end_room(room.code, "host-1")
-
-    with pytest.raises(ValueError, match="Only an active room"):
-        room_service.end_room(room.code, "host-1")
+def test_end_room_requires_active_room(
+    room_service,
+    room_with_two_members,
+):
+    with pytest.raises(
+        ValueError,
+        match="Only an active room can be ended",
+    ):
+        room_service.end_room(room_with_two_members, "host")

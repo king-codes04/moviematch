@@ -139,3 +139,23 @@ def test_match_repository():
     repo.delete_matches(TEST_CODE)
 
     assert repo.get_matches(TEST_CODE) == []
+
+
+
+def test_duplicate_decision_is_not_overwritten():
+    repo = DecisionRepository(redis_client)
+
+    first = repo.submit_decision(
+        TEST_CODE, 1, "emanuel", "like"
+    )
+
+    second = repo.submit_decision(
+        TEST_CODE, 1, "emanuel", "dislike"
+    )
+
+    assert first == 1
+    assert second == 0
+
+    assert repo.get_user_decision(
+        TEST_CODE, 1, "emanuel"
+    ) == "like"
