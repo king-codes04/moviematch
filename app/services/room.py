@@ -12,12 +12,37 @@ class RoomService:
         movie_service,
         movie_repository,
         session_repository=None,
+        decision_repository=None,
+        match_repository=None,
     ):
         self.room_repository = room_repository
         self.member_repository = member_repository
         self.movie_service = movie_service
         self.movie_repository = movie_repository
         self.session_repository = session_repository
+        self.decision_repository = decision_repository
+        self.match_repository = match_repository
+
+    def _delete_room_state(self, code):
+        """Remove all Redis data belonging to a cancelled room."""
+        client = self.room_repository.client
+        keys = [
+            f"ROOM:{code}",
+            f"ROOM:{code}:MEMBERS",
+            f"MOVIES:{code}",
+            f"MOVIES:{code}:BY_ID",
+            f"SESSION:{code}",
+            f"MATCHES:{code}",
+            f"MATCHES:{code}:IDS",
+            f"MATCHES:{code}:BY_ID",
+        ]
+
+        keys.extend(
+            client.scan_iter(match=f"DECISIONS:{code}:*")
+        )
+
+        if keys:
+            client.delete(*keys)
 
     def generate_room_code(self):
         characters = string.ascii_uppercase + string.digits
@@ -41,15 +66,6 @@ class RoomService:
             self.member_repository.add_member(
                 code=code,
                 user_id=host_id,
-            )
-
-            movies = self.movie_service.get_movie_pool(
-                pool_size=10
-            )
-
-            self.movie_repository.add_movies(
-                code=code,
-                movies=movies,
             )
 
         except Exception:
@@ -83,6 +99,81 @@ class RoomService:
             host_id=room["host_id"],
             status=room["status"],
         )
+
+    def get_movie_pool(self, code, user_id):
+        room = self.room_repository.get_room(code)
+
+        if not room:
+            raise ValueError("Room not found")
+
+        if not self.member_repository.member_exists(code, user_id):
+            raise ValueError("User is not a room member")
+
+        if room["status"] != "started":
+            raise ValueError("Room is not started")
+
+        movies = self.movie_repository.get_movies(code)
+
+        if not movies:
+            raise ValueError("Movie pool is unavailable")
+
+        decisions = {}
+        if self.decision_repository:
+            decisions = self.decision_repository.get_user_decisions(
+                code,
+                user_id,
+                [movie["id"] for movie in movies],
+            )
+
+        return [
+            {
+                **movie,
+                "my_decision": decisions.get(movie["id"]),
+            }
+            for movie in movies
+        ]
+
+    def get_room_state(self, code, user_id):
+        room = self.room_repository.get_room(code)
+        if not room:
+            raise ValueError("Room not found")
+
+        if not self.member_repository.member_exists(code, user_id):
+            raise ValueError("User is not a room member")
+
+        movies = []
+        matches = []
+        if room["status"] in {"started", "ended"}:
+            movies = self.movie_repository.get_movies(code)
+            decisions = {}
+            if self.decision_repository:
+                decisions = self.decision_repository.get_user_decisions(
+                    code,
+                    user_id,
+                    [movie["id"] for movie in movies],
+                )
+            movies = [
+                {
+                    **movie,
+                    "my_decision": decisions.get(movie["id"]),
+                }
+                for movie in movies
+            ]
+            if self.match_repository:
+                matches = self.match_repository.get_matches(code)
+
+        return {
+            "room": RoomResponse(
+                code=code,
+                host_id=room["host_id"],
+                status=room["status"],
+            ),
+            "members": sorted(
+                self.member_repository.get_members(code)
+            ),
+            "movies": movies,
+            "matches": matches,
+        }
 
     def join_room(self, code, user_id):
         room = self.room_repository.get_room(code)
@@ -132,12 +223,7 @@ class RoomService:
                     code, member_id
                 )
 
-            self.movie_repository.delete_movies(code)
-
-            if self.session_repository:
-                self.session_repository.delete_session(code)
-
-            self.room_repository.delete_room(code)
+            self._delete_room_state(code)
 
             return {
                 "message": "Host left. Room has been cancelled"
@@ -173,18 +259,27 @@ class RoomService:
                 "At least 2 members are required to start"
             )
 
-        if self.session_repository:
-            self.session_repository.create_session(
-                code=code,
-                status="started",
-                current_round=1,
-            )
+        movies = self.movie_service.get_movie_pool(pool_size=10)
+        self.movie_repository.add_movies(code=code, movies=movies)
 
-        self.room_repository.update_status(code, "started")
+        try:
+            if self.session_repository:
+                self.session_repository.create_session(
+                    code=code,
+                    status="started",
+                )
+
+            self.room_repository.update_status(code, "started")
+        except Exception:
+            self.movie_repository.delete_movies(code)
+            if self.session_repository:
+                self.session_repository.delete_session(code)
+            raise
 
         return {
             "code": code,
             "status": "started",
+            "movie_count": len(movies),
         }
 
     def end_room(self, code, user_id):

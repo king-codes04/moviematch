@@ -1,152 +1,37 @@
+from concurrent.futures import ThreadPoolExecutor
+import uuid
+
 import pytest
 
+from app.core.redis import redis_client
+from app.repositories.decision import DecisionRepository
+from app.repositories.match import MatchRepository
+from app.repositories.member import MemberRepository
+from app.repositories.movie import MovieRepository
+from app.repositories.room import RoomRepository
 from app.schemas.room import DecisionType
 from app.services.matching import MatchingService
 
 
-# ----------------------------
-# Fake repositories
-# ----------------------------
-
-class FakeRoomRepository:
-    def __init__(self, room=None):
-        self.room = room
-
-    def get_room(self, code):
-        return self.room
-
-    def update_status(self, code, status):
-        if self.room is not None:
-            self.room["status"] = status
+MOVIES = [
+    {"id": 101, "title": "Movie One"},
+    {"id": 202, "title": "Movie Two"},
+]
 
 
-class FakeMemberRepository:
-    def __init__(self, members=None):
-        self.members = set(members or [])
+@pytest.fixture
+def matching_context():
+    code = f"MS{uuid.uuid4().hex[:6].upper()}"
+    room_repository = RoomRepository(redis_client)
+    member_repository = MemberRepository(redis_client)
+    movie_repository = MovieRepository(redis_client)
+    decision_repository = DecisionRepository(redis_client)
+    match_repository = MatchRepository(redis_client)
 
-    def member_exists(self, code, user_id):
-        return user_id in self.members
-
-    def get_members(self, code):
-        return self.members.copy()
-
-
-class FakeDecisionRepository:
-    def __init__(self):
-        self.decisions = {}
-
-    def submit_decision(self, code, round_number, user_id, decision):
-        key = (code, round_number)
-        round_decisions = self.decisions.setdefault(key, {})
-
-        # A member cannot overwrite an existing decision.
-        if user_id in round_decisions:
-            return 0
-
-        round_decisions[user_id] = decision
-        return 1
-
-    def get_decisions(self, code, round_number):
-        return self.decisions.get(
-            (code, round_number), {}
-        ).copy()
-
-
-class FakeMovieRepository:
-    def __init__(self, movies=None):
-        self.movies = list(movies or [])
-
-    def add_movies(self, code, movies):
-        self.movies = list(movies)
-
-    def get_movies(self, code):
-        return self.movies.copy()
-
-    def get_next_movie(self, code):
-        if not self.movies:
-            return None
-        return self.movies.pop(0)
-
-    def movie_count(self, code):
-        return len(self.movies)
-
-
-class FakeMatchRepository:
-    def __init__(self):
-        self.matches = []
-
-    def add_match(self, code, movie):
-        self.matches.append(movie)
-
-    def get_matches(self, code):
-        return self.matches.copy()
-
-
-class FakeSessionRepository:
-    def __init__(self, session=None):
-        self.session = dict(
-            session
-            if session is not None
-            else {
-                "status": "started",
-                "current_round": 1,
-            }
-        )
-
-    def get_session(self, code):
-        return self.session.copy()
-
-    def create_session(self, code, status, current_round=0):
-        self.session = {
-            "status": status,
-            "current_round": str(current_round),
-        }
-
-    def update_session(self, code, **fields):
-        self.session.update({
-            key: str(value) if key == "current_round" else value
-            for key, value in fields.items()
-        })
-
-
-# ----------------------------
-# Test setup helper
-# ----------------------------
-
-def make_service(
-    room=None,
-    members=None,
-    decisions=None,
-    lifecycle=False,
-    movies=None,
-):
-    room_repository = FakeRoomRepository(
-        room if room is not None else {
-            "host_id": "user_001",
-            "status": "started",
-        }
-    )
-
-    member_repository = FakeMemberRepository(
-        members if members is not None else {
-            "user_001",
-            "user_002",
-        }
-    )
-
-    decision_repository = (
-        decisions if decisions is not None
-        else FakeDecisionRepository()
-    )
-
-    movie_repository = None
-    match_repository = None
-    session_repository = None
-
-    if lifecycle:
-        movie_repository = FakeMovieRepository(movies)
-        match_repository = FakeMatchRepository()
-        session_repository = FakeSessionRepository()
+    room_repository.create_room("host", "started", code)
+    for user_id in ("host", "member", "third"):
+        member_repository.add_member(code, user_id)
+    movie_repository.add_movies(code, MOVIES)
 
     service = MatchingService(
         room_repository=room_repository,
@@ -154,350 +39,157 @@ def make_service(
         decision_repository=decision_repository,
         movie_repository=movie_repository,
         match_repository=match_repository,
-        session_repository=session_repository,
     )
 
-    return service, decision_repository
+    try:
+        yield code, service, movie_repository, match_repository
+    finally:
+        keys = list(redis_client.scan_iter(match=f"ROOM:{code}*"))
+        keys.extend(redis_client.scan_iter(match=f"MOVIES:{code}*"))
+        keys.extend(redis_client.scan_iter(match=f"DECISIONS:{code}:*"))
+        keys.extend(redis_client.scan_iter(match=f"MATCHES:{code}*"))
+        if keys:
+            redis_client.delete(*set(keys))
 
 
-# ----------------------------
-# Validation tests
-# ----------------------------
+def test_member_can_decide_on_different_movies_without_waiting(
+    matching_context,
+):
+    code, service, movies, matches = matching_context
 
-def test_submit_decision_rejects_missing_room():
-    service, _ = make_service(room={})
+    first = service.submit_decision(code, 101, "host", "like")
+    second = service.submit_decision(code, 202, "member", "skip")
 
-    with pytest.raises(ValueError, match="Room not found"):
-        service.submit_decision(
-            "TEST123", 1, "user_001", "like"
-        )
+    assert first["decision"] == "like"
+    assert first["matched"] is False
+    assert second["decision"] == "skip"
+    assert second["duplicate"] is False
+    assert movies.get_movies(code) == MOVIES
+    assert matches.get_matches(code) == []
 
 
-def test_submit_decision_rejects_room_not_started():
-    service, _ = make_service(
-        room={
-            "host_id": "user_001",
-            "status": "waiting",
-        }
-    )
+def test_two_distinct_likes_create_one_match(matching_context):
+    code, service, _, matches = matching_context
+
+    first = service.submit_decision(code, 101, "host", "like")
+    second = service.submit_decision(code, 101, "member", "like")
+
+    assert first["matched"] is False
+    assert second["matched"] is True
+    assert second["new_match"] is True
+    assert second["match"] == MOVIES[0]
+    assert matches.get_matches(code) == [MOVIES[0]]
+
+
+def test_same_decision_retry_is_idempotent_and_conflict_is_rejected(
+    matching_context,
+):
+    code, service, _, matches = matching_context
+
+    first = service.submit_decision(code, 101, "host", "like")
+    retry = service.submit_decision(code, 101, "host", "like")
+
+    assert first["duplicate"] is False
+    assert retry["duplicate"] is True
+    assert retry["decision"] == "like"
+    assert matches.get_matches(code) == []
+
+    with pytest.raises(ValueError, match="cannot be changed"):
+        service.submit_decision(code, 101, "host", "skip")
+
+
+def test_skip_can_be_upgraded_to_like_but_never_counts_retries_twice(
+    matching_context,
+):
+    code, service, _, matches = matching_context
+
+    skipped = service.submit_decision(code, 101, "host", "skip")
+    upgraded = service.submit_decision(code, 101, "host", "like")
+    retry = service.submit_decision(code, 101, "host", "like")
+
+    assert skipped["decision"] == "skip"
+    assert upgraded["decision"] == "like"
+    assert upgraded["duplicate"] is False
+    assert upgraded["matched"] is False
+    assert retry["duplicate"] is True
+    assert matches.get_matches(code) == []
+
+    with pytest.raises(ValueError, match="cannot be changed"):
+        service.submit_decision(code, 101, "host", "skip")
+
+
+def test_skip_to_like_upgrade_can_create_a_match_once(matching_context):
+    code, service, _, matches = matching_context
+
+    service.submit_decision(code, 101, "host", "skip")
+    service.submit_decision(code, 101, "member", "like")
+    upgraded = service.submit_decision(code, 101, "host", "like")
+
+    assert upgraded["matched"] is True
+    assert upgraded["new_match"] is True
+    assert upgraded["match"] == MOVIES[0]
+    assert matches.get_matches(code) == [MOVIES[0]]
+
+
+def test_third_member_like_does_not_duplicate_a_match(matching_context):
+    code, service, _, matches = matching_context
+
+    service.submit_decision(code, 101, "host", "like")
+    service.submit_decision(code, 101, "member", "like")
+    result = service.submit_decision(code, 101, "third", "like")
+
+    assert result["matched"] is True
+    assert result["new_match"] is False
+    assert matches.match_count(code) == 1
+
+
+def test_concurrent_second_likes_create_one_match(matching_context):
+    code, service, _, matches = matching_context
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda user_id: service.submit_decision(
+                code, 101, user_id, "like"
+            ),
+            ("host", "member"),
+        ))
+
+    assert sum(result["new_match"] for result in results) == 1
+    assert matches.get_matches(code) == [MOVIES[0]]
+
+
+@pytest.mark.parametrize(
+    ("user_id", "movie_id", "decision", "message"),
+    [
+        ("outsider", 101, "like", "not a room member"),
+        ("host", 999, "like", "not in this room's pool"),
+        ("host", 101, "maybe", "Invalid decision"),
+    ],
+)
+def test_invalid_decisions_are_rejected(
+    matching_context,
+    user_id,
+    movie_id,
+    decision,
+    message,
+):
+    code, service, _, _ = matching_context
+
+    with pytest.raises(ValueError, match=message):
+        service.submit_decision(code, movie_id, user_id, decision)
+
+
+def test_decisions_are_rejected_for_waiting_rooms(matching_context):
+    code, service, _, _ = matching_context
+    service.room_repository.update_status(code, "waiting")
 
     with pytest.raises(ValueError, match="Room is not started"):
-        service.submit_decision(
-            "TEST123", 1, "user_001", "like"
-        )
+        service.submit_decision(code, 101, "host", DecisionType.LIKE)
 
 
-def test_submit_decision_rejects_non_member():
-    service, _ = make_service(
-        members={"user_001", "user_002"}
-    )
+def test_legacy_dislike_value_is_stored_as_skip(matching_context):
+    code, service, _, _ = matching_context
 
-    with pytest.raises(
-        ValueError,
-        match="User is not a room member",
-    ):
-        service.submit_decision(
-            "TEST123", 1, "outsider", "like"
-        )
+    result = service.submit_decision(code, 101, "host", "dislike")
 
-
-def test_submit_decision_rejects_invalid_decision():
-    service, _ = make_service()
-
-    with pytest.raises(ValueError, match="Invalid decision"):
-        service.submit_decision(
-            "TEST123", 1, "user_001", "maybe"
-        )
-
-
-def test_submit_decision_rejects_duplicate_vote():
-    service, _ = make_service()
-
-    service.submit_decision(
-        "TEST123", 1, "user_001", "like"
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="User has already decided",
-    ):
-        service.submit_decision(
-            "TEST123", 1, "user_001", "dislike"
-        )
-
-
-# ----------------------------
-# Waiting and matching tests
-# ----------------------------
-
-def test_round_waits_until_every_member_decides():
-    service, _ = make_service(
-        members={"user_001", "user_002", "user_003"}
-    )
-
-    result = service.submit_decision(
-        "TEST123", 1, "user_001", "like"
-    )
-
-    assert result == {
-        "status": "waiting",
-        "round_number": 1,
-    }
-
-
-def test_two_likes_produce_a_match():
-    service, _ = make_service()
-
-    service.submit_decision(
-        "TEST123", 1, "user_001", "like"
-    )
-
-    result = service.submit_decision(
-        "TEST123", 1, "user_002", "like"
-    )
-
-    assert result["status"] == "completed"
-    assert result["round_number"] == 1
-    assert result["matched"] is True
-    assert result["like_count"] == 2
-
-
-def test_one_like_does_not_produce_a_match():
-    service, _ = make_service()
-
-    service.submit_decision(
-        "TEST123", 1, "user_001", "like"
-    )
-
-    result = service.submit_decision(
-        "TEST123", 1, "user_002", "dislike"
-    )
-
-    assert result["status"] == "completed"
-    assert result["matched"] is False
-    assert result["like_count"] == 1
-
-
-def test_no_likes_does_not_produce_a_match():
-    service, _ = make_service()
-
-    service.submit_decision(
-        "TEST123", 1, "user_001", "dislike"
-    )
-
-    result = service.submit_decision(
-        "TEST123", 1, "user_002", "dislike"
-    )
-
-    assert result["status"] == "completed"
-    assert result["matched"] is False
-    assert result["like_count"] == 0
-
-
-def test_string_and_enum_decisions_are_accepted():
-    service, _ = make_service()
-
-    service.submit_decision(
-        "TEST123", 1, "user_001", DecisionType.LIKE
-    )
-
-    result = service.submit_decision(
-        "TEST123", 1, "user_002", DecisionType.DISLIKE
-    )
-
-    assert result["status"] == "completed"
-    assert result["matched"] is False
-
-
-# ----------------------------
-# Direct evaluation tests
-# ----------------------------
-
-def test_evaluate_round_waits_for_missing_decision():
-    service, decisions = make_service(
-        members={"user_001", "user_002"}
-    )
-
-    decisions.submit_decision(
-        "TEST123", 1, "user_001", "like"
-    )
-
-    result = service.evaluate_round("TEST123", 1)
-
-    assert result == {
-        "status": "waiting",
-        "round_number": 1,
-    }
-
-
-def test_evaluate_round_counts_only_likes():
-    service, decisions = make_service(
-        members={"user_001", "user_002", "user_003"}
-    )
-
-    decisions.submit_decision(
-        "TEST123", 1, "user_001", "like"
-    )
-    decisions.submit_decision(
-        "TEST123", 1, "user_002", "like"
-    )
-    decisions.submit_decision(
-        "TEST123", 1, "user_003", "dislike"
-    )
-
-    result = service.evaluate_round("TEST123", 1)
-
-    assert result["status"] == "completed"
-    assert result["like_count"] == 2
-    assert result["matched"] is True
-
-
-def test_decisions_from_another_round_are_not_counted():
-    service, decisions = make_service()
-
-    decisions.submit_decision(
-        "TEST123", 1, "user_001", "like"
-    )
-    decisions.submit_decision(
-        "TEST123", 2, "user_002", "like"
-    )
-
-    result = service.evaluate_round("TEST123", 1)
-
-    assert result["status"] == "waiting"
-
-
-# ----------------------------
-# Full matching lifecycle tests
-# ----------------------------
-
-def test_matching_movie_is_saved_and_next_round_starts():
-    movies = [
-        {"id": 101, "title": "Movie One"},
-        {"id": 102, "title": "Movie Two"},
-    ]
-
-    service, _ = make_service(
-        lifecycle=True,
-        movies=movies,
-    )
-
-    service.submit_decision(
-        "TEST123", 1, "user_001", "like"
-    )
-
-    result = service.submit_decision(
-        "TEST123", 1, "user_002", "like"
-    )
-
-    assert result["status"] == "completed"
-    assert result["matched"] is True
-    assert result["next_round"] == 2
-
-    assert service.match_repository.get_matches(
-        "TEST123"
-    ) == [movies[0]]
-
-    assert service.movie_repository.get_movies(
-        "TEST123"
-    ) == [movies[1]]
-
-    assert service.session_repository.get_session(
-        "TEST123"
-    )["current_round"] == "2"
-
-
-def test_unmatched_movie_is_not_saved():
-    movies = [
-        {"id": 101, "title": "Movie One"},
-        {"id": 102, "title": "Movie Two"},
-    ]
-
-    service, _ = make_service(
-        lifecycle=True,
-        movies=movies,
-    )
-
-    service.submit_decision(
-        "TEST123", 1, "user_001", "like"
-    )
-
-    result = service.submit_decision(
-        "TEST123", 1, "user_002", "dislike"
-    )
-
-    assert result["matched"] is False
-    assert service.match_repository.get_matches("TEST123") == []
-    assert service.movie_repository.get_movies("TEST123") == [movies[1]]
-
-
-def test_round_does_not_advance_until_every_member_decides():
-    movies = [
-        {"id": 101, "title": "Movie One"},
-        {"id": 102, "title": "Movie Two"},
-    ]
-
-    service, _ = make_service(
-        lifecycle=True,
-        members={"user_001", "user_002", "user_003"},
-        movies=movies,
-    )
-
-    result = service.submit_decision(
-        "TEST123", 1, "user_001", "like"
-    )
-
-    assert result["status"] == "waiting"
-    assert service.movie_repository.get_movies("TEST123") == movies
-    assert int(service.session_repository.get_session(
-        "TEST123"
-    )["current_round"]) == 1
-
-
-def test_final_movie_ends_session_and_room():
-    movies = [
-        {"id": 101, "title": "Final Movie"},
-    ]
-
-    service, _ = make_service(
-        lifecycle=True,
-        movies=movies,
-    )
-
-    service.submit_decision(
-        "TEST123", 1, "user_001", "like"
-    )
-
-    result = service.submit_decision(
-        "TEST123", 1, "user_002", "like"
-    )
-
-    assert result["status"] == "ended"
-    assert result["matched"] is True
-    assert service.match_repository.get_matches("TEST123") == movies
-    assert service.movie_repository.get_movies("TEST123") == []
-    assert service.session_repository.get_session(
-        "TEST123"
-    )["status"] == "ended"
-    assert service.room_repository.get_room(
-        "TEST123"
-    )["status"] == "ended"
-
-
-def test_submit_decision_rejects_wrong_session_round():
-    service, _ = make_service(lifecycle=True)
-
-    with pytest.raises(ValueError, match="Invalid round number"):
-        service.submit_decision(
-            "TEST123", 2, "user_001", "like"
-        )
-
-
-def test_submit_decision_rejects_missing_session():
-    service, _ = make_service(lifecycle=True)
-    service.session_repository.session = {}
-
-    with pytest.raises(ValueError, match="Session not found"):
-        service.submit_decision(
-            "TEST123", 1, "user_001", "like"
-        )
+    assert result["decision"] == "skip"

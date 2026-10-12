@@ -5,6 +5,8 @@ from app.repositories.room import RoomRepository
 from app.repositories.member import MemberRepository
 from app.repositories.movie import MovieRepository
 from app.repositories.session import SessionRepository
+from app.repositories.decision import DecisionRepository
+from app.repositories.match import MatchRepository
 from app.services.room import RoomService
 
 
@@ -25,6 +27,8 @@ def room_service():
     member_repository = MemberRepository(redis_client)
     movie_repository = MovieRepository(redis_client)
     session_repository = SessionRepository(redis_client)
+    decision_repository = DecisionRepository(redis_client)
+    match_repository = MatchRepository(redis_client)
     movie_service = FakeMovieService()
 
     service = RoomService(
@@ -33,6 +37,8 @@ def room_service():
         movie_service=movie_service,
         movie_repository=movie_repository,
         session_repository=session_repository,
+        decision_repository=decision_repository,
+        match_repository=match_repository,
     )
 
     yield service
@@ -80,10 +86,10 @@ def test_create_room_adds_host_as_member(room_service):
     assert "host" in members
 
 
-def test_create_room_adds_ten_movies(room_service):
+def test_create_room_defers_movie_pool_until_start(room_service):
     room = room_service.create_room("host")
 
-    assert room_service.movie_repository.movie_count(room.code) == 10
+    assert room_service.movie_repository.movie_count(room.code) == 0
 
 
 def test_get_room_success(room_service):
@@ -99,6 +105,48 @@ def test_get_room_success(room_service):
 def test_get_room_not_found(room_service):
     with pytest.raises(ValueError, match="Room not found"):
         room_service.get_room("MISSING")
+
+
+def test_movie_pool_is_shared_and_requires_started_room_member(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
+
+    with pytest.raises(ValueError, match="Room is not started"):
+        room_service.get_movie_pool(code, "host")
+
+    room_service.start_room(code, "host")
+    host_pool = room_service.get_movie_pool(code, "host")
+    member_pool = room_service.get_movie_pool(code, "member2")
+
+    assert [movie["id"] for movie in host_pool] == list(range(1, 11))
+    assert [movie["id"] for movie in host_pool] == [
+        movie["id"] for movie in member_pool
+    ]
+    assert host_pool[0]["my_decision"] is None
+
+    with pytest.raises(ValueError, match="not a room member"):
+        room_service.get_movie_pool(code, "outsider")
+
+
+def test_room_state_recovers_pool_decisions_and_matches(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
+    room_service.start_room(code, "host")
+    room_service.decision_repository.submit_movie_decision(
+        code, 1, "host", "like"
+    )
+
+    state = room_service.get_room_state(code, "host")
+    member_state = room_service.get_room_state(code, "member2")
+
+    assert state["room"].status == "started"
+    assert state["movies"][0]["my_decision"] == "like"
+    assert member_state["movies"][0]["my_decision"] is None
+    assert state["members"] == ["host", "member2"]
 
 
 def test_join_room_success(room_service):
@@ -191,6 +239,26 @@ def test_host_leaving_cancels_room(
     assert room_service.movie_repository.movie_count(code) == 0
 
 
+def test_host_leaving_removes_decision_history(
+    room_service,
+    room_with_two_members,
+):
+    code = room_with_two_members
+    room_service.member_repository.client.hset(
+        f"DECISIONS:{code}:ROUND:1",
+        mapping={"host": "like"},
+    )
+
+    room_service.leave_room(code, "host")
+
+    assert not room_service.room_repository.room_exists(code)
+    assert not list(
+        room_service.room_repository.client.scan_iter(
+            match=f"DECISIONS:{code}:ROUND:*"
+        )
+    )
+
+
 def test_leave_room_rejects_active_room(
     room_service,
     room_with_two_members,
@@ -213,6 +281,7 @@ def test_start_room_success(
     assert result == {
         "code": code,
         "status": "started",
+        "movie_count": 10,
     }
 
     room = room_service.room_repository.get_room(code)
@@ -235,7 +304,7 @@ def test_start_room_initializes_session(
 
     # Assert
     assert session["status"] == "started"
-    assert session["current_round"] == "1"
+    assert session == {"status": "started"}
 
 
 def test_start_room_not_found(room_service):

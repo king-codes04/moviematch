@@ -26,6 +26,8 @@ def get_room_service():
     member_repository = MemberRepository(redis_client)
     movie_repository = MovieRepository(redis_client)
     session_repository = SessionRepository(redis_client)
+    decision_repository = DecisionRepository(redis_client)
+    match_repository = MatchRepository(redis_client)
 
     movie_service = get_movie_service()
 
@@ -35,6 +37,8 @@ def get_room_service():
         movie_service=movie_service,
         movie_repository=movie_repository,
         session_repository=session_repository,
+        decision_repository=decision_repository,
+        match_repository=match_repository,
     )
 
 

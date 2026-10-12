@@ -5,7 +5,16 @@ import json
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.dependencies import get_room_service, get_matching_service
-from app.schemas.room import CreateRoom, RoomResponse, JoinRoom, Decision
+from app.schemas.room import (
+    CreateRoom,
+    Decision,
+    DecisionResponse,
+    JoinRoom,
+    MoviePoolResponse,
+    MovieResponse,
+    RoomResponse,
+    RoomStateResponse,
+)
 from app.services.room import RoomService
 from app.services.matching import MatchingService
 from app.websockets.routes import manager
@@ -54,8 +63,14 @@ def raise_room_error(error: ValueError):
 
     if message == "Room not found":
         code_status = status.HTTP_404_NOT_FOUND
+    elif message == "Movie is not in this room's pool":
+        code_status = status.HTTP_404_NOT_FOUND
     elif message == "User is not a room member":
         code_status = status.HTTP_403_FORBIDDEN
+    elif message.startswith("Decision is already recorded and cannot be changed"):
+        code_status = status.HTTP_409_CONFLICT
+    elif message == "Room is not started":
+        code_status = status.HTTP_409_CONFLICT
     else:
         code_status = status.HTTP_400_BAD_REQUEST
 
@@ -87,6 +102,36 @@ def get_room(
 ):
     try:
         return room_service.get_room(code)
+    except ValueError as error:
+        raise_room_error(error)
+
+
+@router.get(
+    "/{code}/state",
+    response_model=RoomStateResponse,
+)
+def get_room_state(
+    code: str,
+    user_id: str,
+    room_service: RoomService = Depends(get_room_service),
+):
+    try:
+        return room_service.get_room_state(code, user_id)
+    except ValueError as error:
+        raise_room_error(error)
+
+
+@router.get(
+    "/{code}/movies",
+    response_model=MoviePoolResponse,
+)
+def get_movie_pool(
+    code: str,
+    user_id: str,
+    room_service: RoomService = Depends(get_room_service),
+):
+    try:
+        return {"movies": room_service.get_movie_pool(code, user_id)}
     except ValueError as error:
         raise_room_error(error)
 
@@ -131,14 +176,22 @@ def leave_room(
     try:
         result = room_service.leave_room(code, data.username)
 
-        publish_event(
-            code,
-            "member_left",
-            {
-                "username": data.username,
-                "result": serialize_data(result),
-            },
-        )
+        if "cancelled" in result.get("message", "").lower():
+            publish_event(
+                code,
+                "room_ended",
+                {
+                    "code": code,
+                    "status": "ended",
+                    "reason": "cancelled",
+                },
+            )
+        else:
+            publish_event(
+                code,
+                "member_left",
+                {"username": data.username},
+            )
 
         return result
 
@@ -178,7 +231,7 @@ def end_room(
 
         publish_event(
             code,
-            "session_ended",
+            "room_ended",
             serialize_data(result),
         )
 
@@ -188,10 +241,13 @@ def end_room(
         raise_room_error(error)
 
 
-@router.post("/{code}/rounds/{round_number}/decision")
+@router.post(
+    "/{code}/movies/{movie_id}/decision",
+    response_model=DecisionResponse,
+)
 def submit_decision(
     code: str,
-    round_number: int,
+    movie_id: int,
     data: Decision,
     user_id: str,
     matching_service: MatchingService = Depends(get_matching_service),
@@ -199,47 +255,22 @@ def submit_decision(
     try:
         result = matching_service.submit_decision(
             code=code,
-            round_number=round_number,
+            movie_id=movie_id,
             user_id=user_id,
             decision=data.decision,
         )
 
-        result = serialize_data(result)
-        result_status = result.get("status")
-
-        if result_status == "waiting":
+        if not result["duplicate"]:
             publish_event(
                 code,
-                "decision_waiting",
-                result,
+                "decision_recorded",
+                {"movie_id": movie_id},
             )
-
-        elif result_status == "completed":
-            if result.get("matched"):
-                publish_event(
-                    code,
-                    "match_found",
-                    result,
-                )
-
+        if result["new_match"]:
             publish_event(
                 code,
-                "round_completed",
-                result,
-            )
-
-        elif result_status == "ended":
-            if result.get("matched"):
-                publish_event(
-                    code,
-                    "match_found",
-                    result,
-                )
-
-            publish_event(
-                code,
-                "session_ended",
-                result,
+                "match_found",
+                {"movie": serialize_data(result["match"])},
             )
 
         return result

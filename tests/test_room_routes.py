@@ -42,6 +42,37 @@ class FakeRoomService:
 
         return self.rooms[code]
 
+    def get_movie_pool(self, code, user_id):
+        if code not in self.rooms:
+            raise ValueError("Room not found")
+
+        if user_id not in self.members[code]:
+            raise ValueError("User is not a room member")
+
+        if self.statuses[code] != "started":
+            raise ValueError("Room is not started")
+
+        return [{
+            "id": 123,
+            "title": "A Real Movie",
+            "poster_path": "/poster.jpg",
+            "release_date": "2024-01-01",
+            "vote_average": 7.5,
+            "overview": "Movie overview",
+            "my_decision": None,
+        }]
+
+    def get_room_state(self, code, user_id):
+        movies = []
+        if self.statuses.get(code) == "started":
+            movies = self.get_movie_pool(code, user_id)
+        return {
+            "room": self.rooms[code],
+            "members": sorted(self.members[code]),
+            "movies": movies,
+            "matches": [],
+        }
+
     def join_room(self, code, username):
         if code not in self.rooms:
             raise ValueError("Room not found")
@@ -132,7 +163,7 @@ class FakeMatchingService:
     def submit_decision(
         self,
         code,
-        round_number,
+        movie_id,
         user_id,
         decision,
     ):
@@ -142,14 +173,18 @@ class FakeMatchingService:
 
         self.calls.append({
             "code": code,
-            "round_number": round_number,
+            "movie_id": movie_id,
             "user_id": user_id,
             "decision": decision_value,
         })
 
         return {
-            "status": "waiting",
-            "round_number": round_number,
+            "movie_id": movie_id,
+            "decision": decision_value,
+            "duplicate": False,
+            "matched": False,
+            "new_match": False,
+            "match": None,
         }
 
 
@@ -227,6 +262,53 @@ def test_get_missing_room_returns_404(api_services):
     assert response.status_code == 404
 
 
+def test_get_movie_pool_requires_started_room_member(api_services):
+    client, room_service, _ = api_services
+    room_service.create_room("user_001")
+    room_service.join_room("TEST01", "user_002")
+    room_service.start_room("TEST01", "user_001")
+
+    response = client.get(
+        "/rooms/TEST01/movies",
+        params={"user_id": "user_002"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["movies"] == [{
+        "id": 123,
+        "title": "A Real Movie",
+        "overview": "Movie overview",
+        "poster_path": "/poster.jpg",
+        "release_date": "2024-01-01",
+        "vote_average": 7.5,
+        "genre_ids": [],
+        "my_decision": None,
+    }]
+
+    unauthorized = client.get(
+        "/rooms/TEST01/movies",
+        params={"user_id": "outsider"},
+    )
+    assert unauthorized.status_code == 403
+
+
+def test_room_state_recovers_members_and_pool(api_services):
+    client, room_service, _ = api_services
+    room_service.create_room("user_001")
+    room_service.join_room("TEST01", "user_002")
+    room_service.start_room("TEST01", "user_001")
+
+    response = client.get(
+        "/rooms/TEST01/state",
+        params={"user_id": "user_002"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["members"] == ["user_001", "user_002"]
+    assert response.json()["room"]["status"] == "started"
+    assert response.json()["movies"][0]["my_decision"] is None
+
+
 def test_join_room(api_services):
     client, room_service, _ = api_services
     room_service.create_room("user_001")
@@ -298,23 +380,27 @@ def test_end_room(api_services):
 # Decision route tests
 # ----------------------------
 
-def test_submit_decision(api_services):
+def test_submit_movie_decision(api_services):
     client, _, matching_service = api_services
 
     response = client.post(
-        "/rooms/TEST01/rounds/1/decision?user_id=user_001",
+        "/rooms/TEST01/movies/123/decision?user_id=user_001",
         json={"decision": "like"},
     )
 
     assert response.status_code == 200
     assert response.json() == {
-        "status": "waiting",
-        "round_number": 1,
+        "movie_id": 123,
+        "decision": "like",
+        "duplicate": False,
+        "matched": False,
+        "new_match": False,
+        "match": None,
     }
 
     assert matching_service.calls == [{
         "code": "TEST01",
-        "round_number": 1,
+        "movie_id": 123,
         "user_id": "user_001",
         "decision": "like",
     }]
@@ -324,7 +410,7 @@ def test_invalid_decision_returns_422(api_services):
     client, _, matching_service = api_services
 
     response = client.post(
-        "/rooms/TEST01/rounds/1/decision?user_id=user_001",
+        "/rooms/TEST01/movies/123/decision?user_id=user_001",
         json={"decision": "maybe"},
     )
 
@@ -336,7 +422,7 @@ def test_decision_missing_user_id_returns_422(api_services):
     client, _, matching_service = api_services
 
     response = client.post(
-        "/rooms/TEST01/rounds/1/decision",
+        "/rooms/TEST01/movies/123/decision",
         json={"decision": "like"},
     )
 
@@ -344,7 +430,7 @@ def test_decision_missing_user_id_returns_422(api_services):
     assert matching_service.calls == []
 
 
-def test_submit_decision_broadcasts_result_to_room(api_services):
+def test_submit_decision_broadcasts_without_private_choice(api_services):
     client, room_service, _ = api_services
     room_service.create_room("user_001")
 
@@ -352,22 +438,23 @@ def test_submit_decision_broadcasts_result_to_room(api_services):
         "/ws/TEST01?user_id=user_001"
     ) as websocket:
         response = client.post(
-            "/rooms/TEST01/rounds/1/decision?user_id=user_001",
+            "/rooms/TEST01/movies/123/decision?user_id=user_001",
             json={"decision": "like"},
         )
 
         assert response.status_code == 200
         assert response.json() == {
-            "status": "waiting",
-            "round_number": 1,
+            "movie_id": 123,
+            "decision": "like",
+            "duplicate": False,
+            "matched": False,
+            "new_match": False,
+            "match": None,
         }
 
         message = websocket.receive_json()
 
         assert message == {
-            "event": "decision_waiting",
-            "data": {
-                "status": "waiting",
-                "round_number": 1,
-            },
+            "event": "decision_recorded",
+            "data": {"movie_id": 123},
         }

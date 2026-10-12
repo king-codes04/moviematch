@@ -30,12 +30,15 @@ def cleanup_room(code):
         f"ROOM:{code}",
         f"ROOM:{code}:MEMBERS",
         f"MOVIES:{code}",
+        f"MOVIES:{code}:BY_ID",
         f"SESSION:{code}",
         f"MATCHES:{code}",
+        f"MATCHES:{code}:IDS",
+        f"MATCHES:{code}:BY_ID",
     ]
 
     keys.extend(
-        redis_client.scan_iter(match=f"DECISIONS:{code}:ROUND:*")
+        redis_client.scan_iter(match=f"DECISIONS:{code}:*")
     )
 
     if keys:
@@ -103,7 +106,7 @@ def receive_event(websocket, expected_event):
     return event
 
 
-def test_http_to_redis_movie_matching_flow(integration_client):
+def test_http_to_redis_independent_movie_pool_flow(integration_client):
     client, created_codes = integration_client
 
     # Create a room through HTTP.
@@ -127,7 +130,7 @@ def test_http_to_redis_movie_matching_flow(integration_client):
 
     assert room_repository.room_exists(code)
     assert "host_001" in member_repository.get_members(code)
-    assert movie_repository.movie_count(code) == 2
+    assert movie_repository.movie_count(code) == 0
 
     # Join a second member.
     response = client.post(
@@ -140,44 +143,84 @@ def test_http_to_redis_movie_matching_flow(integration_client):
     # Start the room.
     response = start_room(client, code)
     assert response.json()["status"] == "started"
+    assert response.json()["movie_count"] == 2
 
     session = session_repository.get_session(code)
     assert session["status"] == "started"
-    assert session["current_round"] == "1"
+    assert movie_repository.movie_count(code) == 2
 
-    # First member decides: the round must wait.
+    # Both members recover the same room pool, with private decision state.
+    host_state = client.get(
+        f"/rooms/{code}/state",
+        params={"user_id": "host_001"},
+    ).json()
+    member_state = client.get(
+        f"/rooms/{code}/state",
+        params={"user_id": "member_002"},
+    ).json()
+    assert [movie["id"] for movie in host_state["movies"]] == [101, 202]
+    assert host_state["movies"] == member_state["movies"]
+
+    # A member can decide on another movie without waiting for this one.
     response = client.post(
-        f"/rooms/{code}/rounds/1/decision",
+        f"/rooms/{code}/movies/101/decision",
         params={"user_id": "host_001"},
         json={"decision": "like"},
     )
     assert response.status_code == 200
-    assert response.json()["status"] == "waiting"
+    assert response.json()["duplicate"] is False
     assert movie_repository.movie_count(code) == 2
     assert match_repository.match_count(code) == 0
 
-    # Second member likes: a match is recorded and the round advances.
     response = client.post(
-        f"/rooms/{code}/rounds/1/decision",
+        f"/rooms/{code}/movies/202/decision",
+        params={"user_id": "host_001"},
+        json={"decision": "skip"},
+    )
+    assert response.status_code == 200
+    assert response.json()["decision"] == "skip"
+    assert movie_repository.movie_count(code) == 2
+
+    upgraded = client.post(
+        f"/rooms/{code}/movies/202/decision",
+        params={"user_id": "host_001"},
+        json={"decision": "like"},
+    )
+    assert upgraded.status_code == 200
+    assert upgraded.json()["decision"] == "like"
+    assert upgraded.json()["duplicate"] is False
+
+    upgrade_retry = client.post(
+        f"/rooms/{code}/movies/202/decision",
+        params={"user_id": "host_001"},
+        json={"decision": "like"},
+    )
+    assert upgrade_retry.status_code == 200
+    assert upgrade_retry.json()["duplicate"] is True
+
+    # The second distinct like finds a match while leaving the pool intact.
+    response = client.post(
+        f"/rooms/{code}/movies/101/decision",
         params={"user_id": "member_002"},
         json={"decision": "like"},
     )
     assert response.status_code == 200
 
     result = response.json()
-    assert result["status"] == "completed"
     assert result["matched"] is True
-    assert result["like_count"] == 2
-    assert result["next_round"] == 2
+    assert result["new_match"] is True
 
     matches = match_repository.get_matches(code)
     assert len(matches) == 1
     assert matches[0]["id"] == 101
 
-    assert movie_repository.movie_count(code) == 1
-    session = session_repository.get_session(code)
-    assert session["current_round"] == "2"
-    assert session["status"] == "started"
+    assert movie_repository.movie_count(code) == 2
+    state = client.get(
+        f"/rooms/{code}/state",
+        params={"user_id": "member_002"},
+    ).json()
+    assert len(state["matches"]) == 1
+    assert state["movies"][0]["my_decision"] == "like"
 
 
 def test_member_joined_event_reaches_connected_client(integration_client):
@@ -205,6 +248,50 @@ def test_member_joined_event_reaches_connected_client(integration_client):
         assert event["data"]["username"] == "member_002"
 
 
+def test_decision_retries_conflicts_and_validation(integration_client):
+    client, created_codes = integration_client
+    code = create_room_and_join_member(client, created_codes)
+    start_room(client, code)
+
+    first = client.post(
+        f"/rooms/{code}/movies/101/decision",
+        params={"user_id": "host_001"},
+        json={"decision": "like"},
+    )
+    assert first.status_code == 200
+    assert first.json()["duplicate"] is False
+
+    retry = client.post(
+        f"/rooms/{code}/movies/101/decision",
+        params={"user_id": "host_001"},
+        json={"decision": "like"},
+    )
+    assert retry.status_code == 200
+    assert retry.json()["duplicate"] is True
+
+    conflict = client.post(
+        f"/rooms/{code}/movies/101/decision",
+        params={"user_id": "host_001"},
+        json={"decision": "skip"},
+    )
+    assert conflict.status_code == 409
+
+    outsider = client.post(
+        f"/rooms/{code}/movies/101/decision",
+        params={"user_id": "outsider"},
+        json={"decision": "like"},
+    )
+    assert outsider.status_code == 403
+
+    invalid_movie = client.post(
+        f"/rooms/{code}/movies/999/decision",
+        params={"user_id": "member_002"},
+        json={"decision": "like"},
+    )
+    assert invalid_movie.status_code == 404
+    assert MatchRepository(redis_client).match_count(code) == 0
+
+
 def test_room_started_event_reaches_all_connected_clients(
     integration_client,
 ):
@@ -226,7 +313,7 @@ def test_room_started_event_reaches_all_connected_clients(
             assert member_event["data"]["status"] == "started"
 
 
-def test_matching_round_broadcasts_events_to_all_clients(
+def test_movie_match_broadcasts_events_to_all_clients(
     integration_client,
 ):
     client, created_codes = integration_client
@@ -243,28 +330,20 @@ def test_matching_round_broadcasts_events_to_all_clients(
             receive_event(host_socket, "room_started")
             receive_event(member_socket, "room_started")
 
-            # The first decision must leave the round waiting.
             response = client.post(
-                f"/rooms/{code}/rounds/1/decision",
+                f"/rooms/{code}/movies/101/decision",
                 params={"user_id": "host_001"},
                 json={"decision": "like"},
             )
             assert response.status_code == 200
-            assert response.json()["status"] == "waiting"
+            for websocket in (host_socket, member_socket):
+                decision_event = receive_event(
+                    websocket, "decision_recorded"
+                )
+                assert decision_event["data"] == {"movie_id": 101}
 
-            host_waiting = receive_event(
-                host_socket, "decision_waiting"
-            )
-            member_waiting = receive_event(
-                member_socket, "decision_waiting"
-            )
-
-            assert host_waiting["data"]["round_number"] == 1
-            assert member_waiting["data"]["round_number"] == 1
-
-            # The second decision completes the round and finds a match.
             response = client.post(
-                f"/rooms/{code}/rounds/1/decision",
+                f"/rooms/{code}/movies/101/decision",
                 params={"user_id": "member_002"},
                 json={"decision": "like"},
             )
@@ -272,19 +351,9 @@ def test_matching_round_broadcasts_events_to_all_clients(
             assert response.json()["matched"] is True
 
             for websocket in (host_socket, member_socket):
-                match_event = receive_event(
-                    websocket, "match_found"
+                decision_event = receive_event(
+                    websocket, "decision_recorded"
                 )
-                round_event = receive_event(
-                    websocket, "round_completed"
-                )
-
-                assert match_event["data"]["matched"] is True
-                assert match_event["data"]["round_number"] == 1
-                assert match_event["data"]["matched_movie"]["id"] == 101
-                assert match_event["data"]["next_movie"]["id"] == 202
-
-                assert round_event["data"]["matched"] is True
-                assert round_event["data"]["matched_movie"]["id"] == 101
-                assert round_event["data"]["next_movie"]["id"] == 202
-                assert round_event["data"]["next_round"] == 2
+                assert decision_event["data"] == {"movie_id": 101}
+                match_event = receive_event(websocket, "match_found")
+                assert match_event["data"]["movie"]["id"] == 101

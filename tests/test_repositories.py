@@ -67,12 +67,10 @@ def test_session_repository():
     session = repo.get_session(TEST_CODE)
 
     assert session["status"] == "started"
-    assert session["current_round"] == "0"
     assert repo.session_exists(TEST_CODE) == 1
 
-    repo.update_session(TEST_CODE, current_round=1)
-
-    assert repo.get_session(TEST_CODE)["current_round"] == "1"
+    repo.update_session(TEST_CODE, status="ended")
+    assert repo.get_session(TEST_CODE)["status"] == "ended"
 
     repo.delete_session(TEST_CODE)
 
@@ -81,23 +79,34 @@ def test_session_repository():
 
 def test_decision_repository():
     repo = DecisionRepository(redis_client)
+    rooms = RoomRepository(redis_client)
+    members = MemberRepository(redis_client)
+    movies = MovieRepository(redis_client)
 
-    repo.submit_decision(TEST_CODE, 1, "user_001", "like")
-    repo.submit_decision(TEST_CODE, 1, "user_002", "dislike")
+    rooms.create_room("user_001", "started", TEST_CODE)
+    members.add_member(TEST_CODE, "user_001")
+    members.add_member(TEST_CODE, "user_002")
+    movies.add_movie(TEST_CODE, {"id": 123, "title": "Example"})
 
-    decisions = repo.get_decisions(TEST_CODE, 1)
+    first = repo.submit_movie_decision(
+        TEST_CODE, 123, "user_001", "like"
+    )
+    second = repo.submit_movie_decision(
+        TEST_CODE, 123, "user_002", "skip"
+    )
+    upgraded = repo.submit_movie_decision(
+        TEST_CODE, 123, "user_002", "like"
+    )
 
-    assert decisions == {
-        "user_001": "like",
-        "user_002": "dislike"
-    }
-
-    assert repo.get_user_decision(TEST_CODE, 1, "user_001") == "like"
-    assert repo.has_decided(TEST_CODE, 1, "user_001") is True
-
-    repo.delete_round_decisions(TEST_CODE, 1)
-
-    assert repo.get_decisions(TEST_CODE, 1) == {}
+    assert first == [1, 0]
+    assert second == [1, 0]
+    assert upgraded == [2, 1]
+    assert repo.get_user_decisions(
+        TEST_CODE, "user_001", [123]
+    ) == {123: "like"}
+    assert repo.get_user_decisions(
+        TEST_CODE, "user_002", [123]
+    ) == {123: "like"}
 
 
 def test_movie_repository():
@@ -109,9 +118,11 @@ def test_movie_repository():
     }
 
     repo.add_movie(TEST_CODE, movie)
+    repo.add_movie(TEST_CODE, movie)
 
     assert repo.get_movies(TEST_CODE) == [movie]
     assert repo.movie_count(TEST_CODE) == 1
+    assert repo.get_movie(TEST_CODE, 123) == movie
 
     next_movie = repo.get_next_movie(TEST_CODE)
 
@@ -142,20 +153,12 @@ def test_match_repository():
 
 
 
-def test_duplicate_decision_is_not_overwritten():
-    repo = DecisionRepository(redis_client)
+def test_match_repository_returns_match_by_movie_id():
+    repo = MatchRepository(redis_client)
+    movie = {"id": 456, "title": "Matched Movie"}
 
-    first = repo.submit_decision(
-        TEST_CODE, 1, "emanuel", "like"
-    )
-
-    second = repo.submit_decision(
-        TEST_CODE, 1, "emanuel", "dislike"
-    )
-
-    assert first == 1
-    assert second == 0
-
-    assert repo.get_user_decision(
-        TEST_CODE, 1, "emanuel"
-    ) == "like"
+    assert repo.add_match(TEST_CODE, movie) == 1
+    assert repo.add_match(TEST_CODE, movie) == 0
+    assert repo.get_match(TEST_CODE, 456) == movie
+    assert repo.has_match(TEST_CODE, 456)
+    assert repo.get_matches(TEST_CODE) == [movie]

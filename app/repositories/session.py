@@ -2,12 +2,11 @@ class SessionRepository:
     def __init__(self, client):
         self.client = client
 
-    def create_session(self, code, status, current_round=0):
+    def create_session(self, code, status):
         return self.client.hset(
             f"SESSION:{code}",
             mapping={
                 "status": status,
-                "current_round": current_round
             }
         )
 
