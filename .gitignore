@@ -1,3 +1,8 @@
 __pycache__
 .env
 .venv/
+.env.*
+!.env.example
+.pytest_cache/
+frontend/node_modules/
+frontend/dist/
